@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "dtrwm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = "0.32"
+xkbcommon = "0.8"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+xdg = "2.5"
+log = "0.4"
+env_logger = "0.11"
+argh = "0.1"
+thiserror = "1"
+libc = "0.2"
+
+[build-dependencies]
+wayland-scanner = "0.31"
