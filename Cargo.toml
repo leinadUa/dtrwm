@@ -7,7 +7,9 @@ edition = "2021"
 
 [dependencies]
 wayland-client = "0.31"
-wayland-protocols = "0.32"
+wayland-backend = "0.3"
+wayland-scanner = "0.31"
+bitflags = "2"
 xkbcommon = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

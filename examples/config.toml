@@ -1,0 +1,151 @@
+master_ratio = 0.55
+border_px = 2
+default_layout = "tile"
+focus_follows_mouse = true
+
+[colors]
+focused   = "#88c0d0ff"
+unfocused = "#3b4252ff"
+
+[[bindings]]
+keys   = "Super+Return"
+action = "spawn"
+arg    = "foot"
+
+[[bindings]]
+keys   = "Super+q"
+action = "close"
+
+[[bindings]]
+keys   = "Super+Shift+e"
+action = "quit"
+
+[[bindings]]
+keys   = "Super+j"
+action = "focus_next"
+
+[[bindings]]
+keys   = "Super+k"
+action = "focus_prev"
+
+[[bindings]]
+keys   = "Super+t"
+action = "set_layout"
+arg    = "tile"
+
+[[bindings]]
+keys   = "Super+g"
+action = "set_layout"
+arg    = "grid"
+
+[[bindings]]
+keys   = "Super+m"
+action = "set_layout"
+arg    = "monocle"
+
+[[bindings]]
+keys   = "Super+u"
+action = "set_layout"
+arg    = "float"
+
+[[bindings]]
+keys   = "Super+space"
+action = "toggle_float"
+
+[[bindings]]
+keys   = "Super+r"
+action = "reload"
+
+[[bindings]]
+keys   = "Super+f"
+action = "toggle_fullscreen"
+
+[[bindings]]
+keys   = "Super+1"
+action = "switch_workspace"
+arg    = "1"
+
+[[bindings]]
+keys   = "Super+2"
+action = "switch_workspace"
+arg    = "2"
+
+[[bindings]]
+keys   = "Super+3"
+action = "switch_workspace"
+arg    = "3"
+
+[[bindings]]
+keys   = "Super+4"
+action = "switch_workspace"
+arg    = "4"
+
+[[bindings]]
+keys   = "Super+5"
+action = "switch_workspace"
+arg    = "5"
+
+[[bindings]]
+keys   = "Super+6"
+action = "switch_workspace"
+arg    = "6"
+
+[[bindings]]
+keys   = "Super+7"
+action = "switch_workspace"
+arg    = "7"
+
+[[bindings]]
+keys   = "Super+8"
+action = "switch_workspace"
+arg    = "8"
+
+[[bindings]]
+keys   = "Super+9"
+action = "switch_workspace"
+arg    = "9"
+
+[[bindings]]
+keys   = "Super+Shift+1"
+action = "move_to_workspace"
+arg    = "1"
+
+[[bindings]]
+keys   = "Super+Shift+2"
+action = "move_to_workspace"
+arg    = "2"
+
+[[bindings]]
+keys   = "Super+Shift+3"
+action = "move_to_workspace"
+arg    = "3"
+
+[[bindings]]
+keys   = "Super+Shift+4"
+action = "move_to_workspace"
+arg    = "4"
+
+[[bindings]]
+keys   = "Super+Shift+5"
+action = "move_to_workspace"
+arg    = "5"
+
+[[bindings]]
+keys   = "Super+Shift+6"
+action = "move_to_workspace"
+arg    = "6"
+
+[[bindings]]
+keys   = "Super+Shift+7"
+action = "move_to_workspace"
+arg    = "7"
+
+[[bindings]]
+keys   = "Super+Shift+8"
+action = "move_to_workspace"
+arg    = "8"
+
+[[bindings]]
+keys   = "Super+Shift+9"
+action = "move_to_workspace"
+arg    = "9"
