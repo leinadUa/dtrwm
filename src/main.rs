@@ -5,9 +5,17 @@ mod spawn;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::unix::io::BorrowedFd;
 use wayland_client::{
     backend::{ObjectData, ObjectId},
-    protocol::wl_registry,
+    protocol::{
+        wl_buffer::{self, WlBuffer},
+        wl_compositor::WlCompositor,
+        wl_registry,
+        wl_shm::{self, WlShm},
+        wl_shm_pool::WlShmPool,
+        wl_surface::{self, WlSurface},
+    },
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
 };
 use std::sync::Arc;
@@ -20,14 +28,15 @@ extern "C" fn handle_sighup(_: libc::c_int) {
 use layout::{arrange, Layout, Rect};
 use protocol::{
     river_window_management_v1::client::{
+        river_decoration_v1,
         river_node_v1, river_output_v1, river_pointer_binding_v1,
         river_seat_v1::{self, Modifiers},
         river_window_manager_v1,
         river_window_v1::{self, Edges},
     },
     river_xkb_bindings_v1::client::{river_xkb_binding_v1, river_xkb_bindings_v1},
-    RiverNodeV1, RiverOutputV1, RiverPointerBindingV1, RiverSeatV1, RiverWindowManagerV1,
-    RiverWindowV1, RiverXkbBindingV1, RiverXkbBindingsV1,
+    RiverDecorationV1, RiverNodeV1, RiverOutputV1, RiverPointerBindingV1, RiverSeatV1,
+    RiverWindowManagerV1, RiverWindowV1, RiverXkbBindingV1, RiverXkbBindingsV1,
 };
 
 const BTN_LEFT: u32 = 0x110;
@@ -60,9 +69,19 @@ enum PointerOp {
 unsafe impl Send for PointerOp {}
 unsafe impl Sync for PointerOp {}
 
+struct TopBorder {
+    decor: RiverDecorationV1,
+    surface: WlSurface,
+    pool: Option<WlShmPool>,
+    buffer: Option<WlBuffer>,
+    cur_w: i32,
+    cur_color: u32,
+}
+
 struct WindowState {
     proxy: RiverWindowV1,
     node: Option<RiverNodeV1>,
+    top_border: Option<TopBorder>,
     actual_w: i32,
     actual_h: i32,
     floating: bool,
@@ -95,6 +114,8 @@ struct Op {
 struct State {
     wm: Option<RiverWindowManagerV1>,
     xkb: Option<RiverXkbBindingsV1>,
+    compositor: Option<WlCompositor>,
+    shm_global: Option<WlShm>,
     windows: HashMap<ObjectId, WindowState>,
     window_order: VecDeque<ObjectId>,
     outputs: HashMap<ObjectId, OutputState>,
@@ -106,6 +127,7 @@ struct State {
     default_layout: Layout,
     master_ratio: f64,
     border_px: i32,
+    gap: i32,
     foc_color: (u32, u32, u32, u32),
     unf_color: (u32, u32, u32, u32),
     binding_defs: Vec<(u32, u32, Action)>,
@@ -176,6 +198,8 @@ impl State {
         Self {
             wm: None,
             xkb: None,
+            compositor: None,
+            shm_global: None,
             windows: HashMap::new(),
             window_order: VecDeque::new(),
             outputs: HashMap::new(),
@@ -187,6 +211,7 @@ impl State {
             default_layout,
             master_ratio: cfg.master_ratio,
             border_px: cfg.border_px,
+            gap: cfg.gap,
             foc_color: config::parse_color(&cfg.colors.focused),
             unf_color: config::parse_color(&cfg.colors.unfocused),
             binding_defs,
@@ -205,6 +230,43 @@ impl State {
             pending_actions: Vec::new(),
             running: true,
         }
+    }
+}
+
+fn apply_gap(rects: Vec<Rect>, gap: i32) -> Vec<Rect> {
+    if gap == 0 { return rects; }
+    rects.into_iter().map(|r| Rect {
+        x: r.x + gap,
+        y: r.y + gap,
+        w: (r.w - 2 * gap).max(1),
+        h: (r.h - 2 * gap).max(1),
+    }).collect()
+}
+
+fn color_argb8888(r: u32, g: u32, b: u32, a: u32) -> u32 {
+    let r8 = (r >> 24) as u8;
+    let g8 = (g >> 24) as u8;
+    let b8 = (b >> 24) as u8;
+    let a8 = (a >> 24) as u8;
+    ((a8 as u32) << 24) | ((r8 as u32) << 16) | ((g8 as u32) << 8) | (b8 as u32)
+}
+
+unsafe fn shm_create(size: usize) -> libc::c_int {
+    use std::ffi::CString;
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let name = CString::new(format!("/dtrwm-{}-{}", libc::getpid(), N.fetch_add(1, Ordering::Relaxed))).unwrap();
+    let fd = libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600);
+    libc::shm_unlink(name.as_ptr());
+    libc::ftruncate(fd, size as libc::off_t);
+    fd
+}
+
+unsafe fn shm_fill(fd: libc::c_int, size: usize, color: u32) {
+    let ptr = libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+    if ptr != libc::MAP_FAILED {
+        let pixels = std::slice::from_raw_parts_mut(ptr as *mut u32, size / 4);
+        pixels.fill(color);
+        libc::munmap(ptr, size);
     }
 }
 
@@ -293,6 +355,7 @@ fn reload_config(state: &mut State, qh: &QueueHandle<State>) {
     let cfg = config::load();
     state.master_ratio = cfg.master_ratio;
     state.border_px = cfg.border_px;
+    state.gap = cfg.gap;
     state.focus_follows_mouse = cfg.focus_follows_mouse;
     state.foc_color = config::parse_color(&cfg.colors.focused);
     state.unf_color = config::parse_color(&cfg.colors.unfocused);
@@ -403,7 +466,7 @@ fn run_manage(state: &mut State, wm: &RiverWindowManagerV1, qh: &QueueHandle<Sta
         } else if matches!(op_kind, PointerOp::Move) && !is_floating {
             let area = primary_area(state);
             let tiled = tiled_windows(state);
-            let rects = arrange(current_layout(state), area, tiled.len(), state.master_ratio);
+            let rects = apply_gap(arrange(current_layout(state), area, tiled.len(), state.master_ratio), state.gap);
             let origin = tiled.iter().position(|id| *id == win_id)
                 .and_then(|i| rects.get(i).copied())
                 .map(|r| (r.x + r.w / 2, r.y + r.h / 2))
@@ -425,7 +488,7 @@ fn run_manage(state: &mut State, wm: &RiverWindowManagerV1, qh: &QueueHandle<Sta
                     } else {
                         let area = primary_area(state);
                         let tiled = tiled_windows(state);
-                        let rects = arrange(current_layout(state), area, tiled.len(), state.master_ratio);
+                        let rects = apply_gap(arrange(current_layout(state), area, tiled.len(), state.master_ratio), state.gap);
                         tiled
                             .iter()
                             .position(|id| *id == win_id)
@@ -476,7 +539,7 @@ fn run_manage(state: &mut State, wm: &RiverWindowManagerV1, qh: &QueueHandle<Sta
             let cursor_y = state.swap_origin.1 + state.swap_dy;
             let area = primary_area(state);
             let tiled = tiled_windows(state);
-            let rects = arrange(current_layout(state), area, tiled.len(), state.master_ratio);
+            let rects = apply_gap(arrange(current_layout(state), area, tiled.len(), state.master_ratio), state.gap);
             let target = tiled.iter().zip(rects.iter())
                 .find(|(_, r)| cursor_x >= r.x && cursor_x < r.x + r.w && cursor_y >= r.y && cursor_y < r.y + r.h)
                 .map(|(id, _)| id.clone());
@@ -498,14 +561,26 @@ fn run_manage(state: &mut State, wm: &RiverWindowManagerV1, qh: &QueueHandle<Sta
         if win.node.is_none() {
             let node = win.proxy.get_node(qh, ());
             win.node = Some(node);
-            win.proxy.use_ssd();
+            win.proxy.use_csd();
+            if let Some(comp) = &state.compositor {
+                let surface = comp.create_surface(qh, ());
+                let decor = win.proxy.get_decoration_below(&surface, qh, ());
+                win.top_border = Some(TopBorder {
+                    decor,
+                    surface,
+                    pool: None,
+                    buffer: None,
+                    cur_w: 0,
+                    cur_color: 0,
+                });
+            }
         }
     }
 
     let area = primary_area(state);
     if area.w > 0 && area.h > 0 {
         let tiled = tiled_windows(state);
-        let rects = arrange(current_layout(state), area, tiled.len(), state.master_ratio);
+        let rects = apply_gap(arrange(current_layout(state), area, tiled.len(), state.master_ratio), state.gap);
         for (wid, rect) in tiled.iter().zip(rects.iter()) {
             if let Some(win) = state.windows.get(wid) {
                 win.proxy.propose_dimensions(rect.w, rect.h);
@@ -544,9 +619,36 @@ fn run_manage(state: &mut State, wm: &RiverWindowManagerV1, qh: &QueueHandle<Sta
     wm.manage_finish();
 }
 
-fn run_render(state: &State, wm: &RiverWindowManagerV1) {
+fn update_top_border(tb: &mut TopBorder, shm: &WlShm, w: i32, h: i32, argb: u32, qh: &QueueHandle<State>) {
+    if tb.cur_w != w || tb.cur_color != argb {
+        if let Some(b) = tb.buffer.take() { b.destroy(); }
+        if let Some(p) = tb.pool.take() { p.destroy(); }
+        let size = (w * h * 4) as usize;
+        if size > 0 {
+            let fd = unsafe { shm_create(size) };
+            if fd >= 0 {
+                unsafe { shm_fill(fd, size, argb) };
+                let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+                let pool = shm.create_pool(bfd, size as i32, qh, ());
+                let buf = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, qh, ());
+                tb.surface.attach(Some(&buf), 0, 0);
+                tb.surface.damage_buffer(0, 0, w, h);
+                tb.pool = Some(pool);
+                tb.buffer = Some(buf);
+                tb.cur_w = w;
+                tb.cur_color = argb;
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+    tb.decor.set_offset(-1, -h);
+    tb.decor.sync_next_commit();
+    tb.surface.commit();
+}
+
+fn run_render(state: &mut State, wm: &RiverWindowManagerV1, qh: &QueueHandle<State>) {
     let border = state.border_px;
-    let edges = Edges::from_bits_truncate(15);
+    let edges = Edges::from_bits_truncate(14);
 
     for win in state.windows.values() {
         if win.workspace != state.current_workspace {
@@ -557,20 +659,30 @@ fn run_render(state: &State, wm: &RiverWindowManagerV1) {
     let area = primary_area(state);
     if area.w > 0 && area.h > 0 {
         let tiled = tiled_windows(state);
-        let rects = arrange(current_layout(state), area, tiled.len(), state.master_ratio);
+        let rects = apply_gap(arrange(current_layout(state), area, tiled.len(), state.master_ratio), state.gap);
+
+        let shm = state.shm_global.clone();
+        let foc_color = state.foc_color;
+        let unf_color = state.unf_color;
+        let focused = state.focused.clone();
+        let layout = current_layout(state);
 
         for (wid, rect) in tiled.iter().zip(rects.iter()) {
-            let win = &state.windows[wid];
-            let is_focused = state.focused.as_ref() == Some(wid);
+            let is_focused = focused.as_ref() == Some(wid);
+            let (r, g, b, a) = if is_focused { foc_color } else { unf_color };
+            let argb = color_argb8888(r, g, b, a);
+            let win = state.windows.get_mut(wid).unwrap();
 
             if let Some(node) = &win.node {
                 node.set_position(rect.x, rect.y);
             }
-
-            let (r, g, b, a) = if is_focused { state.foc_color } else { state.unf_color };
             win.proxy.set_borders(edges, border, r, g, b, a);
 
-            if current_layout(state) == Layout::Monocle {
+            if let (Some(tb), Some(ref shm)) = (&mut win.top_border, &shm) {
+                update_top_border(tb, shm, rect.w + 2, border, argb, qh);
+            }
+
+            if layout == Layout::Monocle {
                 if is_focused { win.proxy.show(); } else { win.proxy.hide(); }
             } else {
                 win.proxy.show();
@@ -578,41 +690,32 @@ fn run_render(state: &State, wm: &RiverWindowManagerV1) {
         }
     }
 
-    for wid in &state.window_order {
-        let win = &state.windows[wid];
-        if !win.floating || win.workspace != state.current_workspace {
+    let wids: Vec<ObjectId> = state.window_order.iter().cloned().collect();
+    let shm = state.shm_global.clone();
+    for wid in &wids {
+        if !state.windows.get(wid).map_or(false, |w| w.floating && w.workspace == state.current_workspace) {
             continue;
         }
-
-        let geom = if let Some(op) = &state.op {
-            if op.window_id == *wid {
-                match op.kind {
-                    PointerOp::Move => Rect {
-                        x: op.start_geom.x + op.dx,
-                        y: op.start_geom.y + op.dy,
-                        ..op.start_geom
-                    },
-                    PointerOp::Resize => Rect {
-                        w: (op.start_geom.w + op.dx).max(1),
-                        h: (op.start_geom.h + op.dy).max(1),
-                        ..op.start_geom
-                    },
-                }
-            } else {
-                win.floating_geom
-            }
-        } else {
-            win.floating_geom
+        let geom = {
+            let win = &state.windows[wid];
+            if let Some(op) = &state.op {
+                if op.window_id == *wid {
+                    match op.kind {
+                        PointerOp::Move => Rect { x: op.start_geom.x + op.dx, y: op.start_geom.y + op.dy, ..op.start_geom },
+                        PointerOp::Resize => Rect { w: (op.start_geom.w + op.dx).max(1), h: (op.start_geom.h + op.dy).max(1), ..op.start_geom },
+                    }
+                } else { win.floating_geom }
+            } else { win.floating_geom }
         };
-
-        if let Some(node) = &win.node {
-            node.set_position(geom.x, geom.y);
-            node.place_top();
-        }
-
         let is_focused = state.focused.as_ref() == Some(wid);
         let (r, g, b, a) = if is_focused { state.foc_color } else { state.unf_color };
+        let argb = color_argb8888(r, g, b, a);
+        let win = state.windows.get_mut(wid).unwrap();
+        if let Some(node) = &win.node { node.set_position(geom.x, geom.y); node.place_top(); }
         win.proxy.set_borders(edges, border, r, g, b, a);
+        if let (Some(tb), Some(ref shm)) = (&mut win.top_border, &shm) {
+            update_top_border(tb, shm, geom.w + 2, border, argb, qh);
+        }
         win.proxy.show();
     }
 
@@ -648,6 +751,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             }
             "river_xkb_bindings_v1" => {
                 state.xkb = Some(registry.bind(name, version.min(3), qh, ()));
+            }
+            "wl_compositor" => {
+                state.compositor = Some(registry.bind(name, version.min(4), qh, ()));
+            }
+            "wl_shm" => {
+                state.shm_global = Some(registry.bind(name, version.min(1), qh, ()));
             }
             _ => {}
         }
@@ -689,7 +798,7 @@ impl Dispatch<RiverWindowManagerV1, ()> for State {
             }
             Event::RenderStart => {
                 log::debug!("render_start");
-                run_render(state, wm);
+                run_render(state, wm, qh);
             }
             Event::Window { id } => {
                 let win_id = id.id();
@@ -698,6 +807,7 @@ impl Dispatch<RiverWindowManagerV1, ()> for State {
                     WindowState {
                         proxy: id,
                         node: None,
+                        top_border: None,
                         actual_w: 0,
                         actual_h: 0,
                         floating: false,
@@ -706,7 +816,7 @@ impl Dispatch<RiverWindowManagerV1, ()> for State {
                         fullscreen: false,
                     },
                 );
-                state.window_order.push_front(win_id.clone());
+                state.window_order.push_back(win_id.clone());
                 state.focused = Some(win_id);
             }
             Event::Output { id } => {
@@ -939,8 +1049,28 @@ impl Dispatch<RiverPointerBindingV1, PointerOp> for State {
                     state.swap_source = None;
                 }
             }
-            _ => {}
         }
+    }
+}
+
+impl Dispatch<WlCompositor, ()> for State {
+    fn event(_: &mut Self, _: &WlCompositor, _: wayland_client::protocol::wl_compositor::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<WlShm, ()> for State {
+    fn event(_: &mut Self, _: &WlShm, _: wl_shm::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<WlShmPool, ()> for State {
+    fn event(_: &mut Self, _: &WlShmPool, _: wayland_client::protocol::wl_shm_pool::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<WlBuffer, ()> for State {
+    fn event(_: &mut Self, _: &WlBuffer, _: wl_buffer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<WlSurface, ()> for State {
+    fn event(_: &mut Self, _: &WlSurface, _: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<RiverDecorationV1, ()> for State {
+    fn event(_: &mut Self, _: &RiverDecorationV1, event: river_decoration_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {}
     }
 }
 

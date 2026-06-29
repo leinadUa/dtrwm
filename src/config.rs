@@ -6,6 +6,7 @@ use xkbcommon::xkb;
 pub struct Config {
     pub master_ratio: f64,
     pub border_px: i32,
+    pub gap: i32,
     pub default_layout: String,
     pub focus_follows_mouse: bool,
     pub colors: Colors,
@@ -17,6 +18,7 @@ impl Default for Config {
         Self {
             master_ratio: 0.55,
             border_px: 2,
+            gap: 0,
             default_layout: "tile".into(),
             focus_follows_mouse: false,
             colors: Colors::default(),

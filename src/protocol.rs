@@ -34,6 +34,7 @@ pub mod river_xkb_bindings_v1 {
     }
 }
 
+pub use river_window_management_v1::client::river_decoration_v1::RiverDecorationV1;
 pub use river_window_management_v1::client::river_node_v1::RiverNodeV1;
 pub use river_window_management_v1::client::river_output_v1::RiverOutputV1;
 pub use river_window_management_v1::client::river_pointer_binding_v1::RiverPointerBindingV1;
