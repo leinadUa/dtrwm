@@ -34,6 +34,41 @@ pub mod river_xkb_bindings_v1 {
     }
 }
 
+pub mod xdg_shell {
+    use wayland_client;
+    use wayland_client::protocol::__interfaces::*;
+
+    wayland_scanner::generate_interfaces!("protocols/xdg-shell.xml");
+
+    pub mod client {
+        use super::*;
+        use wayland_client;
+        use wayland_client::protocol::wl_output;
+        use wayland_client::protocol::wl_seat;
+        use wayland_client::protocol::wl_surface;
+
+        wayland_scanner::generate_client_code!("protocols/xdg-shell.xml");
+    }
+}
+
+pub mod wlr_layer_shell_unstable_v1 {
+    use wayland_client;
+    use wayland_client::protocol::__interfaces::*;
+    use super::xdg_shell::*;
+
+    wayland_scanner::generate_interfaces!("protocols/wlr-layer-shell-unstable-v1.xml");
+
+    pub mod client {
+        use super::*;
+        use wayland_client;
+        use wayland_client::protocol::wl_output;
+        use wayland_client::protocol::wl_surface;
+        use crate::protocol::xdg_shell::client::*;
+
+        wayland_scanner::generate_client_code!("protocols/wlr-layer-shell-unstable-v1.xml");
+    }
+}
+
 pub use river_window_management_v1::client::river_decoration_v1::RiverDecorationV1;
 pub use river_window_management_v1::client::river_node_v1::RiverNodeV1;
 pub use river_window_management_v1::client::river_output_v1::RiverOutputV1;
@@ -43,3 +78,5 @@ pub use river_window_management_v1::client::river_window_manager_v1::RiverWindow
 pub use river_window_management_v1::client::river_window_v1::RiverWindowV1;
 pub use river_xkb_bindings_v1::client::river_xkb_binding_v1::RiverXkbBindingV1;
 pub use river_xkb_bindings_v1::client::river_xkb_bindings_v1::RiverXkbBindingsV1;
+pub use wlr_layer_shell_unstable_v1::client::zwlr_layer_shell_v1::ZwlrLayerShellV1;
+pub use wlr_layer_shell_unstable_v1::client::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1;

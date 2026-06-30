@@ -53,6 +53,10 @@ keys   = "Super+space"
 action = "toggle_float"
 
 [[bindings]]
+keys   = "Super+x"
+action = "exec"
+
+[[bindings]]
 keys   = "Super+r"
 action = "reload"
 

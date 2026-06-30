@@ -1,4 +1,5 @@
 mod config;
+mod font;
 mod layout;
 mod protocol;
 mod spawn;
@@ -11,13 +12,16 @@ use wayland_client::{
     protocol::{
         wl_buffer::{self, WlBuffer},
         wl_compositor::WlCompositor,
+        wl_keyboard::{self, WlKeyboard},
         wl_registry,
+        wl_seat::{self, WlSeat},
         wl_shm::{self, WlShm},
         wl_shm_pool::WlShmPool,
         wl_surface::{self, WlSurface},
     },
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
 };
+use xkbcommon::xkb;
 use std::sync::Arc;
 
 static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -35,6 +39,11 @@ use protocol::{
         river_window_v1::{self, Edges},
     },
     river_xkb_bindings_v1::client::{river_xkb_binding_v1, river_xkb_bindings_v1},
+    xdg_shell::client::{
+        xdg_wm_base::{self, XdgWmBase},
+        xdg_surface::{self, XdgSurface},
+        xdg_toplevel::{self, XdgToplevel},
+    },
     RiverDecorationV1, RiverNodeV1, RiverOutputV1, RiverPointerBindingV1, RiverSeatV1,
     RiverWindowManagerV1, RiverWindowV1, RiverXkbBindingV1, RiverXkbBindingsV1,
 };
@@ -45,6 +54,7 @@ const BTN_RIGHT: u32 = 0x111;
 #[derive(Clone)]
 enum Action {
     Spawn(String),
+    Exec,
     Quit,
     Close,
     FocusNext,
@@ -69,6 +79,18 @@ enum PointerOp {
 unsafe impl Send for PointerOp {}
 unsafe impl Sync for PointerOp {}
 
+struct ExecDialog {
+    surface: WlSurface,
+    xdg_surface: XdgSurface,
+    xdg_toplevel: XdgToplevel,
+    input: String,
+    width: i32,
+    height: i32,
+    configured: bool,
+    pool: Option<WlShmPool>,
+    buffer: Option<WlBuffer>,
+}
+
 struct TopBorder {
     decor: RiverDecorationV1,
     surface: WlSurface,
@@ -88,6 +110,7 @@ struct WindowState {
     floating_geom: Rect,
     workspace: u32,
     fullscreen: bool,
+    is_exec_dialog: bool,
 }
 
 struct OutputState {
@@ -116,6 +139,12 @@ struct State {
     xkb: Option<RiverXkbBindingsV1>,
     compositor: Option<WlCompositor>,
     shm_global: Option<WlShm>,
+    xdg_wm_base: Option<XdgWmBase>,
+    wl_seat: Option<WlSeat>,
+    wl_keyboard: Option<WlKeyboard>,
+    xkb_ctx: xkb::Context,
+    xkb_state: Option<xkb::State>,
+    exec_dialog: Option<ExecDialog>,
     windows: HashMap<ObjectId, WindowState>,
     window_order: VecDeque<ObjectId>,
     outputs: HashMap<ObjectId, OutputState>,
@@ -150,6 +179,7 @@ struct State {
 fn parse_action(action: &str, arg: &str) -> Option<Action> {
     match action {
         "spawn" => Some(Action::Spawn(arg.into())),
+        "exec" => Some(Action::Exec),
         "quit" => Some(Action::Quit),
         "close" => Some(Action::Close),
         "focus_next" => Some(Action::FocusNext),
@@ -200,6 +230,12 @@ impl State {
             xkb: None,
             compositor: None,
             shm_global: None,
+            xdg_wm_base: None,
+            wl_seat: None,
+            wl_keyboard: None,
+            xkb_ctx: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            xkb_state: None,
+            exec_dialog: None,
             windows: HashMap::new(),
             window_order: VecDeque::new(),
             outputs: HashMap::new(),
@@ -455,7 +491,7 @@ fn run_manage(state: &mut State, wm: &RiverWindowManagerV1, qh: &QueueHandle<Sta
                     }
                 }
             }
-            Action::Spawn(_) | Action::Quit | Action::Reload => {}
+            Action::Spawn(_) | Action::Quit | Action::Reload | Action::Exec => {}
         }
     }
 
@@ -558,10 +594,36 @@ fn run_manage(state: &mut State, wm: &RiverWindowManagerV1, qh: &QueueHandle<Sta
     let ids: Vec<ObjectId> = state.windows.keys().cloned().collect();
     for id in &ids {
         let win = state.windows.get_mut(id).unwrap();
+        if win.is_exec_dialog {
+            if win.node.is_none() {
+                let node = win.proxy.get_node(qh, ());
+                win.node = Some(node);
+                win.proxy.use_ssd();
+            }
+            win.proxy.propose_dimensions(600, 30);
+            // recompute position every manage cycle in case output dims arrived late
+            {
+                let area = state.outputs.values().next()
+                    .map(|o| Rect { x: o.x, y: o.y, w: o.w, h: o.h })
+                    .unwrap_or_default();
+                if area.w > 0 {
+                    if let Some(w2) = state.windows.get_mut(id) {
+                        w2.floating_geom = Rect {
+                            x: area.x + (area.w - 600) / 2,
+                            y: area.y + 40,
+                            w: 600,
+                            h: 30,
+                        };
+                    }
+                }
+            }
+            continue;
+        }
+        win.proxy.set_tiled(Edges::from_bits_truncate(15));
         if win.node.is_none() {
             let node = win.proxy.get_node(qh, ());
             win.node = Some(node);
-            win.proxy.use_csd();
+            win.proxy.use_ssd();
             if let Some(comp) = &state.compositor {
                 let surface = comp.create_surface(qh, ());
                 let decor = win.proxy.get_decoration_below(&surface, qh, ());
@@ -606,7 +668,15 @@ fn run_manage(state: &mut State, wm: &RiverWindowManagerV1, qh: &QueueHandle<Sta
         }
     }
 
-    if let Some(fid) = state.focused.clone() {
+    let exec_dialog_id = state.windows.iter()
+        .find(|(_, w)| w.is_exec_dialog)
+        .map(|(id, _)| id.clone());
+
+    if let Some(dlg_id) = exec_dialog_id {
+        if let (Some(win), Some(seat)) = (state.windows.get(&dlg_id), state.seats.values().next()) {
+            seat.proxy.focus_window(&win.proxy);
+        }
+    } else if let Some(fid) = state.focused.clone() {
         if let (Some(win), Some(seat)) =
             (state.windows.get(&fid), state.seats.values().next())
         {
@@ -651,7 +721,7 @@ fn run_render(state: &mut State, wm: &RiverWindowManagerV1, qh: &QueueHandle<Sta
     let edges = Edges::from_bits_truncate(14);
 
     for win in state.windows.values() {
-        if win.workspace != state.current_workspace {
+        if win.workspace != state.current_workspace && !win.is_exec_dialog {
             win.proxy.hide();
         }
     }
@@ -693,7 +763,7 @@ fn run_render(state: &mut State, wm: &RiverWindowManagerV1, qh: &QueueHandle<Sta
     let wids: Vec<ObjectId> = state.window_order.iter().cloned().collect();
     let shm = state.shm_global.clone();
     for wid in &wids {
-        if !state.windows.get(wid).map_or(false, |w| w.floating && w.workspace == state.current_workspace) {
+        if !state.windows.get(wid).map_or(false, |w| w.floating && !w.is_exec_dialog && w.workspace == state.current_workspace) {
             continue;
         }
         let geom = {
@@ -732,7 +802,140 @@ fn run_render(state: &mut State, wm: &RiverWindowManagerV1, qh: &QueueHandle<Sta
         win.proxy.show();
     }
 
+    let exec_ids: Vec<ObjectId> = state.windows.iter()
+        .filter(|(_, w)| w.is_exec_dialog)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for wid in exec_ids {
+        let win = state.windows.get_mut(&wid).unwrap();
+        let geom = win.floating_geom;
+        if let Some(node) = &win.node {
+            node.set_position(geom.x, geom.y);
+            node.place_top();
+        }
+        win.proxy.set_borders(Edges::from_bits_truncate(0), 0, 0, 0, 0, 0);
+        win.proxy.show();
+    }
+
     wm.render_finish();
+}
+
+fn show_exec_dialog(state: &mut State, qh: &QueueHandle<State>) {
+    if state.exec_dialog.is_some() { return; }
+    let (comp, wm_base) = match (&state.compositor, &state.xdg_wm_base) {
+        (Some(c), Some(w)) => (c.clone(), w.clone()),
+        _ => { log::warn!("exec: compositor or xdg_wm_base not available"); return; }
+    };
+    let surface = comp.create_surface(qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, qh, ());
+    let xdg_toplevel = xdg_surface.get_toplevel(qh, ());
+    xdg_toplevel.set_app_id("dtrwm-exec".to_string());
+    xdg_toplevel.set_title("exec".to_string());
+    surface.commit();
+    state.exec_dialog = Some(ExecDialog {
+        surface,
+        xdg_surface,
+        xdg_toplevel,
+        input: String::new(),
+        width: 600,
+        height: 30,
+        configured: false,
+        pool: None,
+        buffer: None,
+    });
+    log::info!("exec_dialog created");
+}
+
+fn close_exec_dialog(state: &mut State) {
+    if let Some(dlg) = state.exec_dialog.take() {
+        if let Some(b) = dlg.buffer { b.destroy(); }
+        if let Some(p) = dlg.pool { p.destroy(); }
+        dlg.xdg_toplevel.destroy();
+        dlg.xdg_surface.destroy();
+        dlg.surface.destroy();
+    }
+}
+
+fn path_completion(prefix: &str) -> Option<String> {
+    if prefix.is_empty() || prefix.contains(' ') { return None; }
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let mut matches: Vec<String> = path_var.split(':')
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(prefix) { Some(name) } else { None }
+        })
+        .collect();
+    matches.sort();
+    matches.dedup();
+    matches.into_iter().next()
+}
+
+fn render_exec_dialog(state: &mut State, qh: &QueueHandle<State>) {
+    let shm = match &state.shm_global { Some(s) => s.clone(), None => return };
+    let dlg = match &mut state.exec_dialog { Some(d) => d, None => return };
+    if !dlg.configured { return; }
+
+    let w = dlg.width.max(1) as usize;
+    let h = dlg.height.max(1) as usize;
+    let stride = w;
+    let size = w * h * 4;
+
+    if let Some(b) = dlg.buffer.take() { b.destroy(); }
+    if let Some(p) = dlg.pool.take() { p.destroy(); }
+
+    let fd = unsafe { shm_create(size) };
+    if fd < 0 { return; }
+
+    let buf = unsafe {
+        let ptr = libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+        if ptr == libc::MAP_FAILED { libc::close(fd); return; }
+        std::slice::from_raw_parts_mut(ptr as *mut u32, w * h)
+    };
+
+    let bg: u32 = 0xFF1D2021;
+    let fg_label: u32 = 0xFF888888;
+    let fg_input: u32 = 0xFFD8DEE9;
+    let fg_cursor: u32 = 0xFF88C0D0;
+    let fg_hint: u32 = 0xFF555555;
+
+    buf.fill(bg);
+
+    let y = (h.saturating_sub(8)) / 2;
+    let label = "exec: ";
+    font::draw_str(buf, stride, 8, y, label, fg_label, bg);
+    let input_x = 8 + label.len() * 8;
+    let dlg_input = dlg.input.clone();
+    font::draw_str(buf, stride, input_x, y, &dlg_input, fg_input, bg);
+    let cursor_x = input_x + dlg_input.len() * 8;
+
+    // completion hint: show the suffix of the first PATH match in dim color
+    if let Some(completion) = path_completion(&dlg_input) {
+        let suffix = &completion[dlg_input.len()..];
+        if !suffix.is_empty() && cursor_x + suffix.len() * 8 + 8 <= w {
+            font::draw_str(buf, stride, cursor_x, y, suffix, fg_hint, bg);
+        }
+    }
+
+    if cursor_x + 8 <= w {
+        font::draw_char(buf, stride, cursor_x, y, '_', fg_cursor, bg);
+    }
+
+    unsafe { libc::munmap(buf.as_mut_ptr() as *mut libc::c_void, size); }
+
+    let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let pool = shm.create_pool(bfd, size as i32, qh, ());
+    let buffer = pool.create_buffer(0, w as i32, h as i32, (w * 4) as i32, wl_shm::Format::Argb8888, qh, ());
+    unsafe { libc::close(fd); }
+
+    let dlg = state.exec_dialog.as_mut().unwrap();
+    dlg.surface.attach(Some(&buffer), 0, 0);
+    dlg.surface.damage_buffer(0, 0, w as i32, h as i32);
+    dlg.surface.commit();
+    dlg.pool = Some(pool);
+    dlg.buffer = Some(buffer);
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -757,6 +960,14 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             }
             "wl_shm" => {
                 state.shm_global = Some(registry.bind(name, version.min(1), qh, ()));
+            }
+            "xdg_wm_base" => {
+                state.xdg_wm_base = Some(registry.bind(name, version.min(5), qh, ()));
+            }
+            "wl_seat" => {
+                if state.wl_seat.is_none() {
+                    state.wl_seat = Some(registry.bind(name, version.min(7), qh, ()));
+                }
             }
             _ => {}
         }
@@ -814,6 +1025,7 @@ impl Dispatch<RiverWindowManagerV1, ()> for State {
                         floating_geom: Rect::default(),
                         workspace: state.current_workspace,
                         fullscreen: false,
+                        is_exec_dialog: false,
                     },
                 );
                 state.window_order.push_back(win_id.clone());
@@ -886,6 +1098,26 @@ impl Dispatch<RiverWindowV1, ()> for State {
                             .map(|o| Rect { x: o.x, y: o.y, w: o.w, h: o.h })
                             .unwrap_or_default();
                         w.floating_geom = center_rect(area, 600, 400);
+                    }
+                }
+            }
+            Event::AppId { app_id } => {
+                if app_id.as_deref() == Some("dtrwm-exec") {
+                    if let Some(w) = state.windows.get_mut(&win_id) {
+                        w.is_exec_dialog = true;
+                        w.floating = true;
+                        let area = state
+                            .outputs
+                            .values()
+                            .next()
+                            .map(|o| Rect { x: o.x, y: o.y, w: o.w, h: o.h })
+                            .unwrap_or_default();
+                        w.floating_geom = Rect {
+                            x: area.x + (area.w - 600) / 2,
+                            y: area.y + 40,
+                            w: 600,
+                            h: 30,
+                        };
                     }
                 }
             }
@@ -1005,15 +1237,19 @@ impl Dispatch<RiverXkbBindingV1, Action> for State {
         event: river_xkb_binding_v1::Event,
         action: &Action,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         if !matches!(event, river_xkb_binding_v1::Event::Pressed) {
             return;
         }
+        if state.exec_dialog.is_some() { return; }
         match action {
             Action::Spawn(cmd) => {
                 log::debug!("spawning: {cmd}");
                 spawn::run(cmd);
+            }
+            Action::Exec => {
+                show_exec_dialog(state, qh);
             }
             Action::Quit => {
                 state.running = false;
@@ -1071,6 +1307,158 @@ impl Dispatch<WlSurface, ()> for State {
 impl Dispatch<RiverDecorationV1, ()> for State {
     fn event(_: &mut Self, _: &RiverDecorationV1, event: river_decoration_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         match event {}
+    }
+}
+
+impl Dispatch<WlSeat, ()> for State {
+    fn event(
+        state: &mut Self,
+        seat: &WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            let raw: u32 = capabilities.into();
+            if raw & 2 != 0 && state.wl_keyboard.is_none() {
+                state.wl_keyboard = Some(seat.get_keyboard(qh, ()));
+            }
+        }
+    }
+}
+
+impl Dispatch<WlKeyboard, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_keyboard::Event::Keymap { format, fd, size } => {
+                let fmt: u32 = format.into();
+                if fmt != 1 { return; }
+                use std::os::unix::io::AsRawFd;
+                let raw_fd = fd.as_raw_fd();
+                let ptr = unsafe {
+                    libc::mmap(std::ptr::null_mut(), size as usize, libc::PROT_READ, libc::MAP_PRIVATE, raw_fd, 0)
+                };
+                if ptr == libc::MAP_FAILED { return; }
+                let s = unsafe {
+                    let bytes = std::slice::from_raw_parts(ptr as *const u8, size as usize);
+                    std::str::from_utf8(bytes).unwrap_or("").trim_end_matches('\0').to_string()
+                };
+                unsafe { libc::munmap(ptr, size as usize); }
+                if let Some(km) = xkb::Keymap::new_from_string(&state.xkb_ctx, s, xkb::KEYMAP_FORMAT_TEXT_V1, xkb::COMPILE_NO_FLAGS) {
+                    state.xkb_state = Some(xkb::State::new(&km));
+                }
+            }
+            wl_keyboard::Event::Modifiers { mods_depressed, mods_latched, mods_locked, group, .. } => {
+                if let Some(xs) = &mut state.xkb_state {
+                    xs.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                }
+            }
+            wl_keyboard::Event::Key { key, state: key_state, .. } => {
+                let pressed: u32 = key_state.into();
+                if pressed == 0 { return; }
+                if state.exec_dialog.is_none() { return; }
+
+                let (sym, utf8) = if let Some(xs) = &state.xkb_state {
+                    let kc = key + 8;
+                    (xs.key_get_one_sym(kc.into()).raw(), xs.key_get_utf8(kc.into()))
+                } else { return };
+
+                match sym {
+                    0xff0d | 0xff8d => {
+                        let cmd = state.exec_dialog.as_ref().unwrap().input.clone();
+                        close_exec_dialog(state);
+                        if !cmd.is_empty() { spawn::run(&cmd); }
+                    }
+                    0xff1b => { close_exec_dialog(state); }
+                    0xff08 => {
+                        if let Some(dlg) = &mut state.exec_dialog { dlg.input.pop(); }
+                        render_exec_dialog(state, qh);
+                    }
+                    0xff09 => {
+                        let current = state.exec_dialog.as_ref().map(|d| d.input.clone()).unwrap_or_default();
+                        if let Some(completed) = path_completion(&current) {
+                            if let Some(dlg) = &mut state.exec_dialog {
+                                dlg.input = completed;
+                            }
+                            render_exec_dialog(state, qh);
+                        }
+                    }
+                    _ => {
+                        if !utf8.is_empty() && utf8.chars().all(|c| !c.is_control()) {
+                            if let Some(dlg) = &mut state.exec_dialog { dlg.input.push_str(&utf8); }
+                            render_exec_dialog(state, qh);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<XdgWmBase, ()> for State {
+    fn event(
+        _: &mut Self,
+        wm_base: &XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            wm_base.pong(serial);
+        }
+    }
+}
+
+impl Dispatch<XdgSurface, ()> for State {
+    fn event(
+        state: &mut Self,
+        xdg_surface: &XdgSurface,
+        event: xdg_surface::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let xdg_surface::Event::Configure { serial } = event {
+            xdg_surface.ack_configure(serial);
+            if let Some(dlg) = &mut state.exec_dialog {
+                dlg.configured = true;
+            }
+            render_exec_dialog(state, qh);
+        }
+    }
+}
+
+impl Dispatch<XdgToplevel, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &XdgToplevel,
+        event: xdg_toplevel::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            xdg_toplevel::Event::Configure { width, height, .. } => {
+                if let Some(dlg) = &mut state.exec_dialog {
+                    if width > 0 { dlg.width = width; }
+                    if height > 0 { dlg.height = height; }
+                }
+            }
+            xdg_toplevel::Event::Close => {
+                close_exec_dialog(state);
+            }
+            _ => {}
+        }
     }
 }
 
